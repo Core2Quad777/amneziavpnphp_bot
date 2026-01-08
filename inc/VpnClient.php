@@ -411,43 +411,124 @@ class VpnClient {
     
     /**
      * Remove client from server WireGuard configuration
+     *
+     * Minimal but safe: extract AllowedIPs, remove peer live, update config, syncconf (or down/up), cleanup routes, update clientsTable.
      */
     private static function removeClientFromServer(array $serverData, string $publicKey): void {
         $containerName = $serverData['container_name'];
         
-        // First, remove using wg command (live removal)
+        // 1) Read current config (we need it to extract AllowedIPs for cleanup)
+        $readCmd = sprintf("docker exec -i %s cat /opt/amnezia/awg/wg0.conf", $containerName);
+        $config = self::executeServerCommand($serverData, $readCmd, true);
+        if ($config === null) {
+            $config = '';
+        }
+        
+        // 2) Extract AllowedIPs for this peer (may be multiple, comma-separated)
+        $removedAllowedIPs = self::getPeerAllowedIPsFromConfig($config, $publicKey);
+        
+        // 3) Remove from live interface (wg set ... remove) - best-effort
         $removeCmd = sprintf(
             "docker exec -i %s wg set wg0 peer %s remove",
             $containerName,
             escapeshellarg($publicKey)
         );
+        // run but tolerate failure
+        @self::executeServerCommand($serverData, $removeCmd, true);
         
-        self::executeServerCommand($serverData, $removeCmd, true);
-        
-        // Then remove from wg0.conf file to make it persistent
-        // Use a more reliable method: read, filter, write
-        $readCmd = sprintf("docker exec -i %s cat /opt/amnezia/awg/wg0.conf", $containerName);
-        $config = self::executeServerCommand($serverData, $readCmd, true);
-        
-        // Parse and remove the peer section
+        // 4) Remove peer from wg0.conf persistently
         $newConfig = self::removePeerFromConfig($config, $publicKey);
-        
-        // Write back to file
         $escapedConfig = str_replace("'", "'\\''", $newConfig);
         $writeCmd = sprintf(
-            "docker exec -i %s sh -c 'echo '\''%s'\'' > /opt/amnezia/awg/wg0.conf'",
+            "docker exec -i %s sh -c 'printf \"%s\" > /opt/amnezia/awg/wg0.conf'",
             $containerName,
             $escapedConfig
         );
-        
         self::executeServerCommand($serverData, $writeCmd, true);
         
-        // Save config
+        // 5) Save config
         $saveCmd = sprintf("docker exec -i %s wg-quick save wg0", $containerName);
         self::executeServerCommand($serverData, $saveCmd, true);
         
-        // Remove from clientsTable
+        // 6) wg syncconf to ensure kernel routes are updated; fallback to down/up if process substitution not available
+        $syncCmd = sprintf("docker exec -i %s bash -c 'wg syncconf wg0 <(wg-quick strip /opt/amnezia/awg/wg0.conf)'", $containerName);
+        $syncOut = self::executeServerCommand($serverData, $syncCmd, true);
+        
+        if ($syncOut === null || stripos($syncOut, 'syntax error') !== false || stripos($syncOut, 'not found') !== false || stripos($syncOut, 'cannot') !== false) {
+            // fallback: bring interface down and up (best-effort)
+            $downCmd = sprintf("docker exec -i %s wg-quick down wg0 || true", $containerName);
+            $upCmd   = sprintf("docker exec -i %s wg-quick up wg0 || true", $containerName);
+            self::executeServerCommand($serverData, $downCmd, true);
+            self::executeServerCommand($serverData, $upCmd, true);
+        }
+        
+        // 7) Cleanup lingering routes for each AllowedIP (best-effort)
+        foreach ($removedAllowedIPs as $allowed) {
+            $allowed = trim($allowed);
+            if ($allowed === '') continue;
+            
+            // IPv4
+            $ipPart = explode('/', $allowed)[0];
+            if (filter_var($ipPart, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                $routeDel = sprintf("docker exec -i %s ip -4 route del %s dev wg0 || true", $containerName, escapeshellarg($allowed));
+                self::executeServerCommand($serverData, $routeDel, true);
+            }
+            // IPv6
+            if (filter_var($ipPart, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+                $routeDel6 = sprintf("docker exec -i %s ip -6 route del %s dev wg0 || true", $containerName, escapeshellarg($allowed));
+                self::executeServerCommand($serverData, $routeDel6, true);
+            }
+        }
+        
+        // 8) Remove from clientsTable
         self::removeFromClientsTable($serverData, $publicKey);
+    }
+    
+    /**
+     * Extract AllowedIPs list for a peer identified by its public key from wg0.conf content.
+     * Returns array of strings (e.g. ['10.8.1.2/32']).
+     */
+    private static function getPeerAllowedIPsFromConfig(string $config, string $publicKey): array {
+        $lines = preg_split("/\\r?\\n/", $config);
+        $inPeer = false;
+        $collect = false;
+        $allowed = [];
+        $currentPeerPublicKey = null;
+        
+        foreach ($lines as $line) {
+            $trim = trim($line);
+            if ($trim === '[Peer]') {
+                $inPeer = true;
+                $currentPeerPublicKey = null;
+                $collect = false;
+                continue;
+            }
+            if ($inPeer && $trim === '') {
+                $inPeer = false;
+                $currentPeerPublicKey = null;
+                $collect = false;
+                continue;
+            }
+            if ($inPeer) {
+                if (stripos($trim, 'PublicKey') === 0) {
+                    $parts = preg_split('/=/', $trim, 2);
+                    if (isset($parts[1])) $currentPeerPublicKey = trim($parts[1]);
+                    $collect = ($currentPeerPublicKey === $publicKey);
+                }
+                if ($collect && stripos($trim, 'AllowedIPs') === 0) {
+                    $parts = preg_split('/=/', $trim, 2);
+                    if (isset($parts[1])) {
+                        $vals = explode(',', trim($parts[1]));
+                        foreach ($vals as $v) {
+                            $v = trim($v);
+                            if ($v !== '') $allowed[] = $v;
+                        }
+                    }
+                }
+            }
+        }
+        
+        return $allowed;
     }
     
     /**
@@ -469,12 +550,14 @@ class VpnClient {
             }
             
             // Check if this peer block should be skipped
-            if ($inPeerBlock && strpos($trimmed, 'PublicKey') === 0) {
+            if ($inPeerBlock && stripos($trimmed, 'PublicKey') === 0) {
                 $parts = explode('=', $line, 2);
                 if (count($parts) === 2 && trim($parts[1]) === $publicKey) {
                     $skipBlock = true;
-                    // Remove the [Peer] line that was already added
-                    array_pop($newLines);
+                    // Remove the [Peer] line that was already added (if present)
+                    if (count($newLines) > 0 && trim(end($newLines)) === '[Peer]') {
+                        array_pop($newLines);
+                    }
                     continue;
                 }
             }
@@ -482,7 +565,7 @@ class VpnClient {
             // Skip lines in the block to be removed
             if ($skipBlock && $inPeerBlock) {
                 // Empty line ends the peer block
-                if (empty($trimmed)) {
+                if ($trimmed === '') {
                     $skipBlock = false;
                     $inPeerBlock = false;
                 }
@@ -939,5 +1022,3 @@ class VpnClient {
         return $disabled;
     }
 }
-
-
